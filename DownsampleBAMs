@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+
+#
+# author: M Radey (email: marad_at_uw.edu)
+#
+
+import os, sys, argparse, glob, pysam
+import numpy as np
+from subprocess import call
+from shutil import which, copyfile
+from colorama import init as cinit
+from colorama import Fore, Back, Style
+from multiprocessing import Pool, Manager, cpu_count
+
+cinit(autoreset=True)
+
+version     = "1.0.0"
+
+def get_subfull_core_count():
+    # return the maximum number of CPU cores minus one
+    count = cpu_count()
+    if count > 2: count = count - 1
+    return count
+
+def do_args():
+    maxcores = get_subfull_core_count()
+    desc = "A tool for downsampling a folder of BAM files to either the " +\
+        "lowest common denominator in the set, or to a specific coverage"
+    parser = argparse.ArgumentParser(prog=os.path.basename(__file__),\
+        description=desc)
+    parser.add_argument("indir", help="specifies the input directory " +\
+        "with the BAM files")
+    parser.add_argument("-n", "--threads", type=int, default=maxcores,\
+        help="specifies the number of threads to use. " +\
+        "The default is %(default)s.")
+    parser.add_argument("-c", "--cov", type=int, default=0,\
+        help="specifies the coverage X to downsample to. The default " +\
+        "is %(default)s, which activates LCD downsampling")
+    parser.add_argument("-s", "--suffix", default=".mq30.bam",\
+        help="specifies the suffix to use searching for BAM files. " +\
+        "The default is %(default)s.")
+    return parser.parse_args()
+
+def subsample_bam_read_length(thisbam):
+    # subsample the first million reads in a Fastq file and
+    # return the mean length
+    rlens = []
+    pybam = pysam.AlignmentFile(thisbam, "rb")
+    for areadnum, alignedread in enumerate(pybam.fetch(), start=1):
+        rlens.append(alignedread.query_length)
+        if areadnum >= 1000000: break
+    pybam.close()
+    return np.mean(rlens)
+
+def assess_bams(mydir, dcov, suffix):
+    # parse a set of BAM files and return some stats
+    print(Fore.CYAN + "Tabulating BAM files...")
+    bams = glob.glob(mydir + "/*" + suffix)
+    bdata = {}
+    ldata = {}
+    rdata = {}
+    for bam in bams:
+        pybam = pysam.Samfile(bam, "rb")
+        tcount = 0
+        for rname in pybam.references:
+            tcount += pybam.count(contig=rname, read_callback='all')
+        bdata[bam] = tcount
+        ldata[bam] = subsample_bam_read_length(bam)
+        rdata[bam] = sum(pybam.lengths)
+        pybam.close()
+    return bdata, ldata, rdata
+
+def downsample_bam(vals):
+    # run a downsample-BAM thread
+    (myargs, jobcount) = vals
+    # a proxy object is necessary to sync our changes with
+    # the multiprocessing manager
+    jobprox = jobcount
+    print(Fore.BLUE + "Running... " + " ".join(myargs))
+    print(Fore.WHITE, end='')
+    call(myargs, shell=False)
+    jobprox.pop()
+    # here we sync our changes with the multiprocessing manager
+    jobcount = jobprox
+    print(Fore.CYAN + " ".join([str(len(jobcount)), "jobs remaining."]))
+
+def downsample_bams(bdata, outdir, dcov, ldata, rdata, threads):
+    # downsample a set of BAM files using Picard Tools DownsampleSam
+    # deal with different Picard Tools manifestations
+    picard = which("PicardCommandLine")
+    if picard == None: picard = which("picard")
+    samtools = which("samtools")
+    env = which("env")
+    print(Fore.CYAN + "Downsampling BAM set...")
+    lowcov = 10000
+    for bpath, bcount in bdata.items():
+        mycov = float(bdata[bpath] * ldata[bpath]) / float(rdata[bpath])
+        print(Fore.BLUE + "Coverage is " + str(mycov) + "X for " + bpath)
+        if mycov < lowcov: lowcov = mycov
+    argset = []
+    if dcov == 0:
+        lcdcount = min(bdata.values())
+        print(Fore.BLUE + "Downsampling to LCD: " + str(lowcov) + "X")
+        sys.stdout.write(Style.RESET_ALL)
+        for bpath, bcount in bdata.items():
+            base, ext = os.path.splitext(os.path.basename(bpath))
+            baipath = outdir + "/" + base + ".bam.bai"
+            if bcount == lcdcount:
+                opath = outdir + "/" + base + ".ds-1.0.bam"
+                obai = outdir + "/" + base + ".ds-1.0.bam.bai"
+                copyfile(bpath, opath)
+                copyfile(baipath, obai)
+                continue
+            prob = float(lcdcount) / float(bcount)
+            opath = outdir + "/" + base + ".ds-" +\
+                str('{0:.4f}'.format(prob)) + ".bam"
+            args = [env, 'JAVA_OPTIONS=-Xmx2g -Dpicard.useLegacyParser=false',\
+                picard, "DownsampleSam", "-I", bpath, "-O", opath, "-R",\
+                "null", "-PROBABILITY", str(prob), "-STRATEGY", "Chained",\
+                "-VERBOSITY", "ERROR", "-QUIET", "TRUE", "-CREATE_INDEX",\
+                "TRUE"]
+            argset.append(args)
+    else:
+        # we're downsampling to a specific X coverage
+        for bpath, bcount in bdata.items():
+            base, ext = os.path.splitext(os.path.basename(bpath))
+            baipath = outdir + "/" + base + ".bam.bai"
+            mycov = float(bdata[bpath] * ldata[bpath]) / float(rdata[bpath])
+            prob = float(dcov) / mycov
+            if prob >= 1.0:
+                opath = outdir + "/" + base + ".ds-1.0.bam"
+                copyfile(bpath, opath)
+                copyfile(baipath, opath + ".bai")
+                continue
+                #print(Fore.RED + "ERROR: Requested coverage is greater " +\
+                #    "than current coverage (" + str(mycov) + ") for " + base)
+                #sys.exit()
+            opath = outdir + "/" + base + ".ds-" +\
+                str('{0:.4f}'.format(prob)) + ".bam"
+            args = [env, 'JAVA_OPTIONS=-Xmx2g -Dpicard.useLegacyParser=false',\
+                picard, "DownsampleSam", "-I", bpath, "-O", opath, "-R",\
+                "null", "-PROBABILITY", str(prob), "-STRATEGY", "Chained",\
+                "-VERBOSITY", "ERROR", "-QUIET", "TRUE", "-CREATE_INDEX",\
+                "TRUE"]
+            argset.append(args)
+    # set up multiprocessing
+    print(Fore.CYAN + "Using " + str(threads) + " processor cores...")
+    pool = Pool(processes=int(threads))
+    man = Manager()
+    jobcount = man.list([i for i in range(len(argset))])
+    pool.map(downsample_bam, ([args, jobcount] for args in argset))
+
+def main():
+    # setup
+    args = do_args()
+    # use absolute paths for all files
+    args.indir = os.path.abspath(args.indir)
+    bamdata, lendata, refdata = assess_bams(args.indir, args.cov,\
+        args.suffix)
+    downsample_bams(bamdata, args.indir, args.cov, lendata, refdata,\
+        args.threads)
+    print(Fore.CYAN + "Downsampling done.")
+    return 0
+
+if __name__ == "__main__":
+   sys.exit(main())

@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+
+#
+# author: M Radey (email: marad_at_uw.edu)
+#
+
+import os, sys, argparse, glob, gffutils, pysam
+from shutil import which, copyfile
+from subprocess import call
+from multiprocessing import cpu_count
+from colorama import init as cinit
+from colorama import Fore, Back, Style
+from Bio import SeqIO
+
+cinit(autoreset=True)
+
+version     = "1.0.0"
+cprop       = 0.5
+mincov      = 5
+lcov        = 20
+minfreq     = 0.02
+minqual     = 20
+
+def get_subfull_core_count():
+    # return the maximum number of CPU cores minus one
+    count = cpu_count()
+    if count > 2: count = count - 1
+    return count
+
+def do_args():
+    maxcores = get_subfull_core_count()
+    desc = "A utility for masking reference sequence based output from " +\
+        "ExtractPopulationDiversity"
+    parser = argparse.ArgumentParser(prog=os.path.basename(__file__),\
+        description=desc)
+    parser.add_argument("outdir", help="specifies the directory to process")
+    parser.add_argument("refdir", help="specifies the directory containing " +\
+        "the NCBI-style reference FNA, FAA, and GFF files")
+    parser.add_argument("-c", "--cov", type=int, default=0,\
+        help="downsample BAM files to this specific coverage. The " +\
+        "default is %(default)s, which will downsample to the coverage " +\
+        "level of the BAM file in the cohort with the least coverage.")
+    parser.add_argument("-i", "--minfreq", type=float, default=minfreq,\
+        help="specifies the minimum base frequency for Pi calculations. " +\
+        "The default is %(default)s.")
+    parser.add_argument("-j", "--mincov", type=int, default=mincov,\
+        help="specifies the minimum base coverage for Pi calculations. " +\
+        "The default is %(default)s.")
+    parser.add_argument("-l", "--limit", type=int, default=lcov,\
+        help="specifies the coverage value below which a position will " +\
+        "be designated as low coverage. The default is %(default)s.")
+    parser.add_argument("-m", "--mem", type=int,\
+        default=4, help="specifies the amount of memory in Gigabytes to " +\
+        "use for sorting. The default is %(default)s.")
+    parser.add_argument("-n", "--threads", type=int, default=maxcores,\
+        help="specifies the number of threads to use. " +\
+        "The default is %(default)s.")
+    parser.add_argument("-p", "--covprop", type=float, default=cprop,\
+        help="specifies the low coverage proportion for genes, where " +\
+        "genes more than this proportion of bases under --limit will " +\
+        "be designated as low coverage. The default is %(default)s.")
+    parser.add_argument("-q", "--qmin", type=int, default=minqual,\
+        help="specifies the minimum read base quality, below which " +\
+        "reads will be filtered. The default is %(default)s. Note that " +\
+        "reads flagged in the BAM file as duplicates, secondary " +\
+        "alignments, unmapped, or QC-fail will also be filtered.")
+    parser.add_argument("-t", "--tmp", default="/tmp",\
+        help="specifies the temporary dir to use. The default is %(default)s.")
+    return parser.parse_args()
+
+def dir_check(mydir):
+    # check if a directory exists and if not create it
+    if not os.path.isdir(mydir): os.mkdir(mydir)
+
+def wgs_align_prepare_ref(refdir, mydir, mem, ccores):
+    # given a directory with NCBI-style reference files, set up a another
+    # directory with reference files prepared for BWA-style WGS alignment
+    samtools = which("samtools")
+    # deal with different Picard Tools manifestations
+    picard = which("PicardCommandLine")
+    if picard == None: picard = which("picard")
+    env = which("env")
+    print(Fore.CYAN + "Preparing reference...")
+    dir_check(mydir)
+    fnalist = glob.glob(refdir + "/*.fna")
+    gfflist = glob.glob(refdir + "/*.gff")
+    if not len(fnalist) == 1 or not len(gfflist) == 1:
+        print(Fore.RED + "ERROR: Too many or not enough reference " +\
+            "files in the reference directory. Please include one " +\
+            ".gff and one .fna file.")
+        sys.exit()
+    baseref, ext = os.path.splitext(os.path.basename(fnalist[0]))
+    lref = mydir + "/" + baseref + ".fa"
+    ldict = mydir + "/" + baseref + ".dict"
+    if not os.path.isfile(lref):
+        print(Fore.BLUE + "Copying reference...")
+        copyfile(fnalist[0], lref)
+    args1 = [samtools, "faidx", lref]
+    print(Fore.BLUE + "Indexing reference...")
+    print(" ".join(args1))
+    call(args1, shell=False)
+    if not os.path.isfile(ldict):
+        args1 = [env, 'JAVA_OPTIONS=-Dpicard.useLegacyParser=false -Xmx' +\
+            str(mem) + 'g', picard, "CreateSequenceDictionary", "-R", lref,\
+            "-O", ldict, "-VERBOSITY", "WARNING", "-QUIET", "TRUE"]
+        print(Fore.BLUE + "Creating sequence dictionary...")
+        print(Fore.BLUE + " ".join(args1))
+        call(args1, shell=False)
+    return lref, ldict, fnalist[0], gfflist[0]
+
+def parse_gff_gene_positions(thisgff):
+    # parse a GFF file and return a dictionary with the postions of 
+    # all the genes
+    print(Fore.CYAN + "Reading GFF...")
+    print(thisgff)
+    genes = {}
+    db = gffutils.create_db(thisgff, ':memory:', force=True,\
+        keep_order=True, merge_strategy='merge', sort_attribute_values=True)
+    for feat in db.features_of_type('gene'):
+        if 'gene' in feat.attributes:
+            genes[feat['gene'][0]] = (feat.start, feat.end)
+        else:
+            genes[feat['locus_tag'][0]] = (feat.start, feat.end)
+    print(Fore.CYAN + "Read " + str(len(genes.keys())) + " genes.")
+    return genes
+
+def extract_pi_data(genes, outdir, ref, qualmin, mfreq, mcov, covlimit,\
+    covprop, dcov, skip, myround=None, dext=None):
+    if dext == None: dext = ".deduped.bam"
+    samtools = which("samtools")
+    dbs = which("DownsampleBAMs")
+    dbams = []
+    if not skip == True:
+        # downsample the BAM files
+        if dcov == 0:
+            print(Fore.CYAN + "Downsampling BAM files to lowest coverage " +\
+                "BAM file...")
+            args1 = [dbs, '-s', dext, outdir]
+            print(Fore.BLUE + " ".join(args1))
+            call(args1, shell=False)
+        else:
+            print(Fore.CYAN + "Downsampling BAM files to " + str(dcov) +\
+                "X coverage...")
+            args1 = [dbs, '-s', dext, '-c', str(dcov), outdir]
+            print(Fore.BLUE + " ".join(args1))
+            call(args1, shell=False)
+    if not dext == ".deduped.bam" and not myround == None:
+        dbams = glob.glob(outdir + '/*.round' + str(myround) + '.deduped' +\
+            '.ds-*.bam')
+    elif not myround == None:
+        dbams = glob.glob(outdir + '/*.round' + str(myround) + '.deduped.bam')
+    else:
+        dbams = glob.glob(outdir + '/*.ds-*.bam')
+    # loop through each downsampled BAM file
+    for dbam in dbams:
+        base, ext = os.path.splitext(os.path.basename(dbam))
+        outfile = outdir + '/' + base + '.gene-pi.tab'
+        rawfile = outdir + '/' + base + '.gene-raw.tab'
+        allfile = outdir + '/' + base + '.all-raw.tab'
+        dbnm = outdir + '/' + base + '.nummapped.txt'
+        gPPWNDsum = 0.0
+        glens = 0
+        rPi = {}
+        pybam = pysam.Samfile(dbam, "rb", ignore_truncation=True)
+        mcount = pybam.count(read_callback='all')
+        with open(dbnm, 'w') as o: o.write(str(mcount) + "\n")
+        refdict = SeqIO.to_dict(SeqIO.parse(ref, "fasta"))
+        print(Fore.BLUE + "Processing " + dbam + "...")
+        o = open(outfile, 'w')
+        p = open(rawfile, 'w')
+        a = open(allfile, 'w')
+        # loop through each aligned replicon
+        for name, length in zip(pybam.references, pybam.lengths):
+            if not name in refdict:
+                print(Fore.RED + "ERROR: reference mismatch " +\
+                    "between BAM and Fasta...")
+                print(name + " <-> " + ' '.join(refdict.keys()))
+                sys.exit()
+            #iplist = get_indel_region_positions(pybam, name, 10, 20)
+            # get read allele counts for all positions
+            # http://pysam.readthedocs.io
+            # /en/latest/api.html#pysam.AlignmentFile.count_coverage
+            print(Fore.BLUE + "Getting aligned read base counts...")
+            A_Array, C_Array, G_Array, T_Array =\
+                pybam.count_coverage(name, start=0, stop=length,\
+                read_callback='all', quality_threshold=qualmin)
+                #read_callback=keep_nonindelsnp_reads,\
+                #quality_threshold=qualmin)
+            # note that PySAM and BioPython coordinates are 0-indexed,
+            # while gffutils coordinates are 1-indexed
+            p.write('\t'.join(["replicon", "gene", "pos", "cov",\
+                "Acov", "Ccov", "Gcov", "Tcov", "NumPWDiffs",\
+                "TotalPWComps", "PropPWNucDiff"]) + '\n')
+            a.write('\t'.join(["replicon", "pos", "cov",\
+                "Acov", "Ccov", "Gcov", "Tcov", "NumPWDiffs",\
+                "TotalPWComps", "PropPWNucDiff"]) + '\n')
+            print(Fore.BLUE + "Scanning genes...")
+            # loop through each gene
+            for gname in genes.keys():
+                outtext = "\rGene: " + gname + "       "
+                sys.stdout.write(outtext)
+                sys.stdout.flush()
+                gstart, gend = genes[gname]
+                glen = gend - gstart
+                glens += glen
+                PPWNDsum = 0.0
+                lc = 0
+                # loop through the gene positions, 0-indexed
+                for pos in range(gstart-1, gend):
+                    PropPWNucDiff = 0.0
+                    #if not pos in iplist:
+                    if True:
+                        Acov, Ccov, Gcov, Tcov = A_Array[pos], C_Array[pos],\
+                            G_Array[pos], T_Array[pos]
+                        cov = Acov + Ccov + Gcov + Tcov
+                        # count this base as low coverage if it's less than
+                        # the limit
+                        if cov < covlimit: lc += 1
+                        # zero out frequency / coverage values that don't meet
+                        # our minimums
+                        Afreq, Cfreq, Gfreq, Tfreq = covs_to_freqs(Acov, Ccov,\
+                            Gcov, Tcov, cov, mcov)
+                        cov, Acov, Ccov, Gcov, Tcov =\
+                            adjust_covs_with_freqs(Afreq, Cfreq,\
+                            Gfreq, Tfreq, Acov, Ccov, Gcov, Tcov, cov, mfreq)
+                        # calculate pairwise diffs
+                        NumPWDiffs = (Acov * Ccov) + (Acov * Gcov) +\
+                            (Acov * Tcov) + (Ccov * Gcov) + (Ccov * Tcov) +\
+                            (Gcov * Tcov)
+                        # calculate total pairwise comparisons
+                        TotalPWComps = ((float(cov) * float(cov)) -\
+                            float(cov)) / 2.0;
+                        # calculate Pi (Di from Nelson & Hughes 2015)
+                        if TotalPWComps > 0.0:
+                            PropPWNucDiff = float(NumPWDiffs) / TotalPWComps
+                        p.write('\t'.join([name, gname, str(pos+1), str(cov),\
+                            str(Acov), str(Ccov), str(Gcov), str(Tcov),\
+                            str(NumPWDiffs), str(TotalPWComps),\
+                            str(PropPWNucDiff)]) + '\n')
+                    else:
+                        lc += 1
+                        p.write('\t'.join([name, gname, str(pos+1), str(0),\
+                            str(0), str(0), str(0), str(0), str(0), str(0.0),\
+                            str(PropPWNucDiff)]) + '\n')
+                    PPWNDsum += PropPWNucDiff
+                lcov = "N"
+                # determine if the low coverage portion of our gene
+                # exceeds our maximum
+                if float(lc) / float(glen) > covprop: lcov = "Y"
+                # calculate Pi for the gene
+                gPi = PPWNDsum / float(glen)
+                # add all the gene Pi values to the coding total
+                gPPWNDsum += PPWNDsum
+                o.write('\t'.join([name, gname, str(gPi), lcov]) + '\n')
+                #str('{0:.6f}'.format(gPi))]) + '\n')
+            sys.stdout.write("             ")
+            sys.stdout.flush()
+            print("")
+            # loop through all replicon positions
+            rPPWNDsum = 0.0
+            print(Fore.BLUE + "Evaluating replicon " + name)
+            for pos in range(length):
+                # pos positions are 0-based; realpos positions are 1-based
+                realpos = pos + 1
+                # update counter if we've completed 10000 positions
+                if realpos % 10000 == 0:
+                    outtext = "\rPosition: " + name + " " + str(realpos)
+                    sys.stdout.write(outtext)
+                    sys.stdout.flush()
+                PropPWNucDiff = 0.0
+                #if not pos in iplist:
+                if True:
+                    Acov, Ccov, Gcov, Tcov = A_Array[pos], C_Array[pos],\
+                        G_Array[pos], T_Array[pos]
+                    cov = Acov + Ccov + Gcov + Tcov
+                    # zero out frequency / coverage values that don't meet
+                    # our minimums
+                    Afreq, Cfreq, Gfreq, Tfreq = covs_to_freqs(Acov, Ccov,\
+                        Gcov, Tcov, cov, mcov)
+                    cov, Acov, Ccov, Gcov, Tcov =\
+                        adjust_covs_with_freqs(Afreq, Cfreq, Gfreq, Tfreq,\
+                        Acov, Ccov, Gcov, Tcov, cov, mfreq)
+                    # calculate pairwise diffs
+                    NumPWDiffs = (Acov * Ccov) + (Acov * Gcov) +\
+                        (Acov * Tcov) + (Ccov * Gcov) + (Ccov * Tcov) +\
+                        (Gcov * Tcov)
+                    # calculate total pairwise comparisons
+                    TotalPWComps = ((float(cov) * float(cov)) -\
+                        float(cov)) / 2.0;
+                    # calculate Pi (Di from Nelson & Hughes 2015)
+                    if TotalPWComps > 0.0:
+                        PropPWNucDiff = float(NumPWDiffs) / TotalPWComps
+                    a.write('\t'.join([name, str(pos+1), str(cov),\
+                        str(Acov), str(Ccov), str(Gcov), str(Tcov),\
+                        str(NumPWDiffs), str(TotalPWComps),\
+                        str(PropPWNucDiff)]) + '\n')
+                else:
+                    a.write('\t'.join([name, str(pos+1), str(cov),\
+                        str(0), str(0), str(0), str(0),\
+                        str(0.0), str(0.0), str(PropPWNucDiff)]) + '\n')
+                rPPWNDsum += PropPWNucDiff
+
+            print("")
+            rPi[name] = rPPWNDsum / float(length)
+        o.close()
+        p.close()
+        a.close()
+        PiCoding = 0.0
+        if float(glens) > 0.0:
+            PiCoding = gPPWNDsum / float(glens)
+        outfile = outdir + '/' + base + '.rep-pi.tab'
+        with open(outfile, 'w') as o:
+            for name in rPi.keys():
+                o.write('\t'.join([name,\
+                    str('{0:.9f}'.format(rPi[name]))]) + '\n')
+            o.write('\t'.join(['Coding',\
+                str('{0:.9f}'.format(PiCoding))]) + '\n')
+
+def covs_to_freqs(ACov, CCov, GCov, TCov, Cov, MinCov):
+    # use coverage information to generate frequency information
+    # for alignments
+    AFreq = 0.0
+    if ACov > MinCov:
+        AFreq = float(ACov) / float(Cov)
+    CFreq = 0.0
+    if CCov > MinCov:
+        CFreq = float(CCov) / float(Cov)
+    GFreq = 0.0
+    if GCov > MinCov:
+        GFreq = float(GCov) / float(Cov)
+    TFreq = 0.0
+    if TCov > MinCov:
+        TFreq = float(TCov) / float(Cov)
+    return AFreq, CFreq, GFreq, TFreq
+
+def adjust_covs_with_freqs(AFreq, CFreq, GFreq, TFreq, ACov, CCov,\
+    GCov, TCov, Cov, MinFreq):
+    # use frequency information to adjust coverage values
+    # for alignments
+    if AFreq < MinFreq and Cov > 0:
+        Cov = Cov - ACov
+        ACov = 0
+    if CFreq < MinFreq and Cov > 0:
+        Cov = Cov - CCov
+        CCov = 0
+    if GFreq < MinFreq and Cov > 0:
+        Cov = Cov - GCov
+        GCov = 0
+    if TFreq < MinFreq and Cov > 0:
+        Cov = Cov - TCov
+        TCov = 0
+    return Cov, ACov, CCov, GCov, TCov
+
+def main():
+    # setup
+    args = do_args()
+    args.refdir = os.path.abspath(args.refdir)
+    args.outdir = os.path.abspath(args.outdir)
+    dir_check(args.outdir)
+    aligndir = args.outdir + "/align"
+    myref, mydict, myfna, mygff =\
+        wgs_align_prepare_ref(args.refdir, aligndir,\
+        args.mem, args.threads)
+    mygenes = parse_gff_gene_positions(mygff)
+    for around in range(1, 11):
+        print(Fore.CYAN + "Round " + str(around) + "...")
+        origbams = glob.glob(aligndir + "/*.mq30.deduped.bam")
+        newbams = []
+        for obam in origbams:
+            namebits = obam.split(".")
+            rname = ".".join(namebits[:-2]) + ".round" + str(around) +\
+                ".deduped.bam"
+            newbams.append(rname)
+            os.rename(obam, rname)
+            os.rename(obam + ".bai", rname + ".bai")
+        extract_pi_data(mygenes, aligndir, myref, args.qmin,\
+            args.minfreq, args.mincov, args.limit, args.covprop, args.cov,\
+            False, around, ".round" + str(around) + ".deduped.bam")
+        for rname, obam in zip(newbams, origbams):
+            os.rename(rname, obam)
+            os.rename(rname + ".bai", obam + ".bai")
+    print(Fore.CYAN + "Done.")
+    return 0
+
+if __name__ == "__main__":
+   sys.exit(main())
+
+

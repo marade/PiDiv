@@ -1,5 +1,5 @@
 # PiDiv
-Pi diversity tool.
+PiDiv is a tool for profiling nucleotide diversity using the π (pi) metric.
 ## Install
 The following dependencies are required to run PiDiv:
 * PySam

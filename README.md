@@ -20,7 +20,7 @@ Place the three PiDiv Python scripts somewhere in your path to use them, e.g.
 
     git clone https://github.com/marade/PiDiv.git
     sudo install -m 0755 PiDiv/AlignReads /usr/local/bin/
-    sudo install -m 0755 PiDiv/PiDiv /usr/local/bin/
+    sudo install -m 0755 PiDiv/DownsampleBAMs /usr/local/bin/
     sudo install -m 0755 PiDiv/PiDiv /usr/local/bin/
     
 ## Run

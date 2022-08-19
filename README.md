@@ -25,4 +25,4 @@ Place the three PiDiv Python scripts somewhere in your path to use them, e.g.
     
 ## Run
 
-First run the AlingReads script to create initial alignments. Then run PiDiv to do the downsampling and pi calculations.
+First run the AlignReads script to create initial alignments. Then run PiDiv to do the downsampling and pi calculations.
